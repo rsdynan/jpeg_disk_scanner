@@ -1,0 +1,19 @@
+# Output files
+scan_log.csv
+scan_partial_report.txt
+scan_report.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
