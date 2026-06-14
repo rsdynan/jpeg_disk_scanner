@@ -122,6 +122,12 @@ Usage examples
   python scan_jpegs.py "E:\Photos" --repair --output "C:\Recovered" ^
       --report "C:\scan_report.txt" --timeout 10 --verbose
 
+  # Raw byte copy — no validation, just copy everything off the drive:
+  python scan_jpegs.py "E:\Photos" --copy-only --output "C:\RawCopy"
+
+  # Raw copy of a single file:
+  python scan_jpegs.py "E:\Photos\0386.jpg" --copy-only --output "C:\RawCopy"
+
 Requirements
 ------------
   pip install Pillow          # image validation
@@ -206,6 +212,7 @@ import hashlib
 import argparse
 import logging
 import csv
+import shutil
 import signal
 import time
 from pathlib import Path
@@ -261,6 +268,7 @@ PIXEL_ANOMALY   = 'PIXEL_ANOMALY'   # decoded but contains suspicious pixel regi
 UNSTABLE_READ   = 'UNSTABLE_READ'   # two reads returned different bytes (bad sector)
 EXIF_MISMATCH   = 'EXIF_MISMATCH'   # EXIF dimensions differ from decoded dimensions
 SLOW_READ       = 'SLOW_READ'       # read succeeded but took suspiciously long
+COPIED          = 'COPIED'          # raw byte copy, no validation
 REPAIRED        = 'REPAIRED'
 REPAIR_FAILED   = 'REPAIR_FAILED'
 SKIPPED         = 'SKIPPED'
@@ -300,7 +308,7 @@ class ScanResult:
 
     @property
     def is_corrupt(self):
-        return self.status not in (OK, REPAIRED, SKIPPED, SLOW_READ)
+        return self.status not in (OK, REPAIRED, SKIPPED, SLOW_READ, COPIED)
 
     def __str__(self):
         tag  = f'[{self.status}]'
@@ -377,6 +385,43 @@ def kill_process_tree(proc: multiprocessing.Process) -> None:
 # MUST be a module-level function — Windows spawn pickles the target and
 # can only pickle module-level callables.
 # ---------------------------------------------------------------------------
+def _copy_target(path_str: str, output_dir_str: str,
+                 queue: multiprocessing.Queue) -> None:
+    """
+    Child-process entry point for --copy-only mode.
+    Reads the file with shutil.copy2 (preserves timestamps) and reports
+    bytes copied.  Runs in a separate process so a stuck read on a bad
+    sector can be killed by the main process after --timeout seconds.
+    """
+    import time, hashlib, shutil
+    from pathlib import Path
+    t0   = time.perf_counter()
+    src  = Path(path_str)
+    dest = Path(output_dir_str) / src.name
+    try:
+        t_read = time.perf_counter()
+        data   = src.read_bytes()          # read first so we can hash it
+        read_secs = time.perf_counter() - t_read
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        # Preserve timestamps
+        shutil.copystat(str(src), str(dest))
+        md5 = hashlib.md5(data).hexdigest()
+        queue.put(dict(
+            path=path_str, size=len(data), status='COPIED',
+            detail=f"Raw copy written to {dest}",
+            duration=time.perf_counter() - t0,
+            repaired_path=str(dest), md5=md5,
+            warnings=[], read_secs=read_secs,
+        ))
+    except OSError as e:
+        queue.put(dict(
+            path=path_str, size=0, status=IO_ERROR,
+            detail=str(e), duration=time.perf_counter() - t0,
+            repaired_path=None, md5=None, warnings=[], read_secs=None,
+        ))
+
+
 def _proc_target(path_str: str, repair: bool, output_dir_str: Optional[str],
                  queue: multiprocessing.Queue,
                  slow_threshold: float = DEFAULT_SLOW_THRESHOLD) -> None:
@@ -975,6 +1020,8 @@ def main():
         help=('Path to a folder or single JPEG file to scan.  '              'Examples: E:\\Photos   or   E:\\Photos\\IMG_001.jpg'))
     ap.add_argument('--repair', action='store_true',
         help=('Enable repair mode.  Salvageable files are copied to --output '              'using the best available strategy (structural patch or raw copy). '              'The external drive is NEVER modified.'))
+    ap.add_argument('--copy-only', action='store_true',
+        help=('Raw byte copy mode.  Every file is copied to --output exactly '              'as read from disk — no validation, no modification. '              'Fastest way to get all files off a failing drive. '              'Cannot be combined with --repair.'))
     ap.add_argument('--output', default=None,
         help=('Destination folder for repaired/recovered copies '              '(default: ./repaired_jpegs).  Use a path on a healthy local drive.'))
     ap.add_argument('--report', default=None,
@@ -1010,15 +1057,28 @@ def main():
             sys.exit(0)
         log.info(f"Folder mode: {scan_root}")
 
+    if args.copy_only and args.repair:
+        log.error("--copy-only and --repair are mutually exclusive. "
+                  "Use --repair for validated copies, --copy-only for a "
+                  "fast raw byte-for-byte copy with no validation.")
+        sys.exit(1)
+
     output_dir = None
-    if args.repair:
-        output_dir = Path(args.output) if args.output else Path('repaired_jpegs')
+    if args.repair or args.copy_only:
+        default_out = 'copied_files' if args.copy_only else 'repaired_jpegs'
+        output_dir  = Path(args.output) if args.output else Path(default_out)
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             log.error(f"Cannot create output folder '{output_dir}': {e}")
             sys.exit(1)
-        if target.is_file():
+        if args.copy_only:
+            if target.is_file():
+                log.info(f"Copy-only mode — raw copy will be written to: "
+                         f"{output_dir / target.name}")
+            else:
+                log.info(f"Copy-only mode — raw copies will go to: {output_dir}")
+        elif target.is_file():
             log.info(f"Repair mode ON — copy will be written to: "
                      f"{output_dir / target.name}")
         else:
@@ -1057,16 +1117,24 @@ def main():
                 break
 
             prefix = f"[{i}/{len(jpegs)}]"
-            print(f"\r  {prefix} Scanning: {path.name[:70]:<70}", end='', flush=True)
+            verb   = "Copying" if args.copy_only else "Scanning"
+            print(f"\r  {prefix} {verb}: {path.name[:70]:<70}", end='', flush=True)
 
             # Use a Queue instead of Manager().dict() — no extra server process.
             queue = multiprocessing.Queue()
-            proc  = multiprocessing.Process(
-                target=_proc_target,
-                args=(str(path), args.repair, output_dir_str, queue,
-                      args.slow_threshold),
-                daemon=True,
-            )
+            if args.copy_only:
+                proc = multiprocessing.Process(
+                    target=_copy_target,
+                    args=(str(path), output_dir_str, queue),
+                    daemon=True,
+                )
+            else:
+                proc = multiprocessing.Process(
+                    target=_proc_target,
+                    args=(str(path), args.repair, output_dir_str, queue,
+                          args.slow_threshold),
+                    daemon=True,
+                )
             current_proc = proc
             proc.start()
             proc.join(args.timeout)
@@ -1118,7 +1186,7 @@ def main():
             results.append(r)
             append_csv_row(csv_writer, csv_fh, i, r)
 
-            if r.is_corrupt or r.status in (IO_ERROR, TIMEOUT, REPAIRED, SLOW_READ) or args.verbose:
+            if r.is_corrupt or r.status in (IO_ERROR, TIMEOUT, REPAIRED, SLOW_READ, COPIED) or args.verbose:
                 print()
                 level = logging.WARNING if r.is_corrupt else logging.INFO
                 log.log(level, f"{prefix} {r}")
@@ -1143,21 +1211,27 @@ def main():
     ok_count       = sum(1 for r in results if r.status == OK)
     corrupt_count  = sum(1 for r in results if r.is_corrupt)
     repaired_count = sum(1 for r in results if r.status == REPAIRED)
+    copied_count   = sum(1 for r in results if r.status == COPIED)
     error_count    = sum(1 for r in results if r.status in (IO_ERROR, TIMEOUT))
     slow_count     = sum(1 for r in results if r.status == SLOW_READ)
     warning_count  = sum(1 for r in results if r.warnings)
 
-    banner = "SCAN INTERRUPTED — PARTIAL RESULTS" if interrupted else "SCAN COMPLETE"
+    banner = "COPY INTERRUPTED — PARTIAL RESULTS" if (interrupted and args.copy_only)         else "COPY COMPLETE" if args.copy_only         else "SCAN INTERRUPTED — PARTIAL RESULTS" if interrupted         else "SCAN COMPLETE"
     print("\n" + "=" * 60)
     print(f"  {banner}")
-    print(f"  Total scanned  : {len(results)}  (of {len(jpegs)} found)")
-    print(f"  Healthy (OK)   : {ok_count}")
-    print(f"  Corrupt/damaged: {corrupt_count}")
-    print(f"  Repaired copies: {repaired_count}")
-    print(f"  I/O errors     : {error_count}")
-    print(f"  Slow reads     : {slow_count}  (>{args.slow_threshold}s)")
-    print(f"  Warnings       : {warning_count}  (EXIF/pixel anomalies)")
-    print(f"  Time           : {elapsed:.1f}s")
+    print(f"  Total files    : {len(results)}  (of {len(jpegs)} found)")
+    if args.copy_only:
+        print(f"  Copied         : {copied_count}")
+        print(f"  Failed         : {error_count}")
+    else:
+        print(f"  Healthy (OK)   : {ok_count}")
+        print(f"  Corrupt/damaged: {corrupt_count}")
+        print(f"  Repaired copies: {repaired_count}")
+        print(f"  I/O errors     : {error_count}")
+        print(f"  Slow reads     : {slow_count}  (>{args.slow_threshold}s)")
+        print(f"  Warnings       : {warning_count}  (EXIF/pixel anomalies)")
+    print(f"  Output folder  : {output_dir}" if output_dir else "", end='')
+    print(f"\n  Time           : {elapsed:.1f}s")
     print("=" * 60)
 
     if args.report:
