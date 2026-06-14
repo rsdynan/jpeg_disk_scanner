@@ -1,4 +1,4 @@
-"""
+r"""
 scan_jpegs.py — JPEG Disk Health Scanner & Repair Tool
 ========================================================
 Scans a folder (and subfolders) on an external drive for JPEG files that are
@@ -6,25 +6,121 @@ corrupted or unreadable due to disk problems.  By default the script is
 READ-ONLY — it never modifies the external drive unless you explicitly pass
 --repair.
 
-Usage
------
+General workflow
+----------------
+  Step 1 — Install dependencies (one time only):
+
+    pip install Pillow psutil piexif numpy
+
+    Pillow   : required for image decoding and pixel-level checks.
+    psutil   : required for reliable process-tree killing when the drive
+               hangs on a bad sector.  Strongly recommended.
+    piexif   : used to read and correct EXIF metadata.  Optional but
+               improves EXIF mismatch detection and raw-copy repair.
+    numpy    : used for pixel anomaly detection.  Optional.
+
+  Step 2 — Run a read-only scan first to assess the damage:
+
+    python scan_jpegs.py "E:\Photos" --report "C:\scan_report.txt"
+
+    This is completely safe — nothing on the drive is touched.  A text
+    report and a CSV log (scan_log.csv) are written to your current
+    directory.  The CSV is updated after every file so partial results
+    are preserved even if the scan is interrupted.
+
+  Step 3 — Review the report, then run with --repair if needed:
+
+    python scan_jpegs.py "E:\Photos" --repair --output "C:\Recovered" ^
+        --report "C:\scan_report.txt"
+
+    Repaired and raw copies are written to C:\Recovered.  The external
+    drive is never modified.
+
+  Step 4 — Verify the recovered copies:
+
+    Open a sample of the repaired files in an image viewer to confirm the
+    intact regions look correct.  Partially-damaged files will show
+    solid-colour blocks where data was unrecoverable — this is expected.
+
+  Timeouts and bad sectors:
+    If the drive is actively failing, reads can hang indefinitely at the
+    OS level.  The script spawns each file read in a separate process so
+    it can forcibly kill a stuck read after --timeout seconds (default 10).
+    If many files are timing out, the drive I/O queue may be in a degraded
+    state — consider a shorter timeout (--timeout 5) to keep the scan
+    moving, and use the report to identify which files need attention.
+    Files that time out cannot be repaired; the data did not reach the OS.
+
+  If the PowerShell window hangs after Ctrl+C:
+    A stuck kernel I/O call on a bad sector can prevent even a killed
+    process from releasing its handles.  The most reliable recovery is to
+    physically unplug the USB cable — this breaks the kernel wait
+    immediately and frees the window.  Running taskkill /F /IM python.exe
+    from a second elevated PowerShell also works once the drive I/O
+    completes or times out at the hardware level.
+
+Arguments
+---------
+  target
+    Path to the folder or single JPEG file to scan.
+    Examples:  E:\Photos          (scan entire folder)
+               E:\Photos\0386.jpg  (scan one file)
+
+  --repair
+    Enable repair mode.  Salvageable files are copied to --output.
+    The external drive is never written to.  Two strategies are used
+    automatically — see "Repair modes" below.
+
+  --output PATH
+    Destination folder for repaired/recovered copies.
+    Default: ./repaired_jpegs  (created in the current directory).
+    Use a path on a healthy local drive, not the external drive.
+
+  --report PATH
+    Write a full text report to this path at the end of the scan.
+    A CSV log with the same base name is also written incrementally.
+    Example: --report "C:\scan_report.txt"  →  also writes scan_report.csv
+
+  --timeout SECONDS
+    How long to wait for a single file read before killing the worker
+    process and marking the file as TIMEOUT.  Default: 10 seconds.
+    Increase for very large files or very slow drives (--timeout 60).
+    Decrease if the drive is actively failing and you want to keep moving
+    (--timeout 5).
+
+  --slow-threshold SECONDS
+    Successful reads that take longer than this are flagged as SLOW_READ.
+    Default: 2.0 seconds.  Adjust based on the normal speed of your drive.
+
+  --max-depth N
+    Limit folder recursion to N levels deep.  Default: unlimited.
+
+  --verbose
+    Print a line for every file, not just problems.
+
+Usage examples
+--------------
   # Scan a single file (safe, no changes made):
-  python scan_jpegs.py "E:\\Photos\\IMG_001.jpg"
+  python scan_jpegs.py "E:\Photos\IMG_001.jpg"
 
   # Scan an entire folder:
-  python scan_jpegs.py "E:\\Photos"
+  python scan_jpegs.py "E:\Photos"
 
   # Scan and attempt repairs (copies repaired files to a local output folder):
-  python scan_jpegs.py "E:\\Photos" --repair --output "C:\\Repaired"
+  python scan_jpegs.py "E:\Photos" --repair --output "C:\Repaired"
 
   # Single file with a longer timeout (useful for drives with bad sectors):
-  python scan_jpegs.py "E:\\Photos\\IMG_001.jpg" --timeout 60
+  python scan_jpegs.py "E:\Photos\IMG_001.jpg" --timeout 60
 
   # Limit scan depth and set a longer I/O timeout:
-  python scan_jpegs.py "E:\\Photos" --max-depth 2 --timeout 15
+  python scan_jpegs.py "E:\Photos" --max-depth 2 --timeout 15
 
   # Save a detailed report:
-  python scan_jpegs.py "E:\\Photos" --report "C:\\scan_report.txt"
+  python scan_jpegs.py "E:\Photos" --report "C:\scan_report.txt"
+
+  # Full run: scan, repair, save report, verbose output:
+  python scan_jpegs.py "E:\Photos" --repair --output "C:\Recovered" ^
+      --report "C:\scan_report.txt" --timeout 10 --verbose
 
 Requirements
 ------------
@@ -355,13 +451,17 @@ def _worker_scan(path_str: str, repair: bool,
         data2 = path.read_bytes()
         md5_2 = hashlib.md5(data2).hexdigest()
         if md5_2 != md5:
-            return make(
-                UNSTABLE_READ,
+            detail = (
                 "File returned DIFFERENT data on two successive reads — "
                 "strong indicator of a failing disk sector. "
-                f"Read-1 MD5: {md5}  Read-2 MD5: {md5_2}",
-                size, md5, read_secs=read_secs,
+                f"Read-1 MD5: {md5}  Read-2 MD5: {md5_2}"
             )
+            if repair and output_dir:
+                dest = output_dir / path.name
+                r_status, r_detail = _attempt_repair(data, dest, raw=True)
+                return make(r_status, r_detail, size, md5,
+                            dest if r_status == REPAIRED else None, read_secs)
+            return make(UNSTABLE_READ, detail, size, md5, read_secs=read_secs)
     except OSError as e:
         warnings.append(f"Verify-read failed (could not read file a second time): {e}")
 
@@ -416,7 +516,20 @@ def _worker_scan(path_str: str, repair: bool,
             return make(r_status, r_detail, size, md5,
                         dest if r_status == REPAIRED else None, read_secs)
 
-    return make(final_status, final_detail, size, md5, read_secs=read_secs)
+        return make(final_status, final_detail, size, md5, read_secs=read_secs)
+
+    # File passed all checks.  If repair mode is active, still write a
+    # verified clean copy — the user explicitly requested it (common when
+    # scanning a single file or wanting to migrate healthy files off a
+    # failing drive alongside the damaged ones).
+    if repair and output_dir:
+        dest = output_dir / path.name
+        r_status, r_detail = _attempt_repair(data, dest, raw=True)
+        r_detail = "File is healthy; " + r_detail
+        return make(r_status, r_detail, size, md5,
+                    dest if r_status == REPAIRED else None, read_secs)
+
+    return make(OK, 'File reads cleanly', size, md5, read_secs=read_secs)
 
 
 # ---------------------------------------------------------------------------
@@ -849,28 +962,31 @@ _shutdown = _ShutdownFlag()
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Scan a folder or single file for corrupt JPEGs (read-only by default).",
+        description=(
+            "JPEG Disk Health Scanner & Repair Tool\n"
+            "Scans a folder or single file for corrupt or damaged JPEG images.\n"
+            "READ-ONLY by default — pass --repair to copy salvageable files locally.\n"
+            "Run with --help for full documentation."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     ap.add_argument('target',
-        help='Path to a single JPEG file or a folder, e.g. E:\\Photos\\IMG_001.jpg')
+        help=('Path to a folder or single JPEG file to scan.  '              'Examples: E:\\Photos   or   E:\\Photos\\IMG_001.jpg'))
     ap.add_argument('--repair', action='store_true',
-        help='Attempt to repair corrupt files — copies go to --output; '
-             'the external drive is NEVER modified.')
+        help=('Enable repair mode.  Salvageable files are copied to --output '              'using the best available strategy (structural patch or raw copy). '              'The external drive is NEVER modified.'))
     ap.add_argument('--output', default=None,
-        help='Local folder for repaired copies (default: ./repaired_jpegs)')
+        help=('Destination folder for repaired/recovered copies '              '(default: ./repaired_jpegs).  Use a path on a healthy local drive.'))
     ap.add_argument('--report', default=None,
-        help='Path for a detailed text report (e.g. C:\\scan_report.txt)')
+        help=('Write a full text report to this path at the end of the scan. '              'A CSV log with the same base name is also written incrementally '              'after every file.  Example: C:\\scan_report.txt'))
     ap.add_argument('--max-depth', type=int, default=None,
-        help='Maximum subfolder depth to recurse (default: unlimited)')
+        help='Limit folder recursion to N levels deep (default: unlimited).')
     ap.add_argument('--timeout', type=float, default=10.0,
-        help='Seconds to wait for a single file read before killing the worker (default: 10)')
+        help=('Seconds to wait for a single file read before killing the worker '              'and marking the file TIMEOUT (default: 10). '              'Increase for large files or very slow drives; '              'decrease if the drive is actively failing.'))
     ap.add_argument('--slow-threshold', type=float, default=DEFAULT_SLOW_THRESHOLD,
-        help=f'Seconds above which a successful read is flagged SLOW_READ '
-             f'(default: {DEFAULT_SLOW_THRESHOLD})')
+        help=(f'Successful reads slower than this are flagged SLOW_READ '              f'(default: {DEFAULT_SLOW_THRESHOLD}s). '              'Adjust to match the normal speed of your drive.'))
     ap.add_argument('--verbose', action='store_true',
-        help='Print OK files too, not just problems')
+        help='Print a result line for every file, not just problems.')
     args = ap.parse_args()
 
     target = Path(args.target)
@@ -897,7 +1013,16 @@ def main():
     output_dir = None
     if args.repair:
         output_dir = Path(args.output) if args.output else Path('repaired_jpegs')
-        log.info(f"Repair mode ON — repaired copies will go to: {output_dir}")
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.error(f"Cannot create output folder '{output_dir}': {e}")
+            sys.exit(1)
+        if target.is_file():
+            log.info(f"Repair mode ON — copy will be written to: "
+                     f"{output_dir / target.name}")
+        else:
+            log.info(f"Repair mode ON — repaired copies will go to: {output_dir}")
     else:
         log.info("Read-only scan mode (no files will be modified)")
 
